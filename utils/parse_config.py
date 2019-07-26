@@ -12,7 +12,7 @@ def parse_model_config(path):
             module_defs.append({})
             module_defs[-1]['type'] = line[1:-1].rstrip()
             if module_defs[-1]['type'] == 'convolutional':
-                module_defs[-1]['batch_normalize'] = 0
+                module_defs[-1]['batch_normalize'] = 0 # initialize the bn to be 0
         else:
             key, value = line.split("=")
             value = value.strip()
