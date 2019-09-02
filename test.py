@@ -34,12 +34,24 @@ def evaluate(model, path, iou_thres, conf_thres, nms_thres, img_size, batch_size
     labels = []
     sample_metrics = []  # List of tuples (TP, confs, pred)
     for batch_i, (_, imgs, targets) in enumerate(tqdm.tqdm(dataloader, desc="Detecting objects")):
-
+        # filter out class labels not included
+        flag = 0
+        has_class = False
+        for i in range(targets.size()[0]):
+            if targets[i, 1] < 5:
+                has_class = True
+                if flag == 0:
+                    target_n = (targets[i, :]).view(1, 6)
+                    flag = 1
+                else:
+                    target_n = torch.cat((target_n, (targets[i, :]).view(1, 6)), 0)
+        if has_class is False:
+            continue
         # Extract labels
-        labels += targets[:, 1].tolist()
+        labels += target_n[:, 1].tolist()
         # Rescale target
-        targets[:, 2:] = xywh2xyxy(targets[:, 2:])
-        targets[:, 2:] *= img_size
+        target_n[:, 2:] = xywh2xyxy(target_n[:, 2:])
+        target_n[:, 2:] *= img_size
 
         imgs = Variable(imgs.type(Tensor), requires_grad=False)
 
@@ -47,7 +59,7 @@ def evaluate(model, path, iou_thres, conf_thres, nms_thres, img_size, batch_size
             outputs = model(imgs)
             outputs = non_max_suppression(outputs, conf_thres=conf_thres, nms_thres=nms_thres)
 
-        sample_metrics += get_batch_statistics(outputs, targets, iou_threshold=iou_thres)
+        sample_metrics += get_batch_statistics(outputs, target_n, iou_threshold=iou_thres)
 
     # Concatenate sample statistics
     true_positives, pred_scores, pred_labels = [np.concatenate(x, 0) for x in list(zip(*sample_metrics))]
@@ -61,7 +73,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8, help="size of each image batch")
     parser.add_argument("--model_def", type=str, default="config/yolov3.cfg", help="path to model definition file")
     parser.add_argument("--data_config", type=str, default="config/coco.data", help="path to data config file")
-    parser.add_argument("--weights_path", type=str, default="weights/yolov3.weights", help="path to weights file")
+    parser.add_argument("--weights_path", type=str, default="checkpoints/yolov3_ckpt_10.pth", help="path to weights file")
     parser.add_argument("--class_path", type=str, default="data/coco.names", help="path to class label file")
     parser.add_argument("--iou_thres", type=float, default=0.5, help="iou threshold required to qualify as detected")
     parser.add_argument("--conf_thres", type=float, default=0.001, help="object confidence threshold")
