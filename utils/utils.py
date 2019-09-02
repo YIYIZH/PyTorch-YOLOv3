@@ -173,7 +173,7 @@ def get_batch_statistics(outputs, targets, iou_threshold):
                 if pred_label not in target_labels:
                     continue
 
-                iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes).max(0)
+                iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes.float()).max(0)
                 if iou >= iou_threshold and box_index not in detected_boxes:
                     true_positives[pred_i] = 1
                     detected_boxes += [box_index]
@@ -263,16 +263,29 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
 
     return output
 
+def compute_loss(pred, targets):
+    pred_boxes = pred[..., :3]
+    pred_cls = pred[..., 5:9]
+    has_class, iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf = build_targets(
+        pred_boxes=pred_boxes,
+        pred_cls=pred_cls,
+        target=targets,
+        anchors=None,
+        ignore_thres=0.5,
+    )
+    if has_class is False:
+        return 0
+    return 0
+
 
 def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
-
     ByteTensor = torch.cuda.ByteTensor if pred_boxes.is_cuda else torch.ByteTensor
     FloatTensor = torch.cuda.FloatTensor if pred_boxes.is_cuda else torch.FloatTensor
 
-    nB = pred_boxes.size(0)
-    nA = pred_boxes.size(1)
-    nC = pred_cls.size(-1)
-    nG = pred_boxes.size(2)
+    nB = pred_boxes.size(0) #batch number
+    nA = pred_boxes.size(1) #anchor number
+    nC = pred_cls.size(-1) #class number
+    nG = pred_boxes.size(2) #grid size
 
     # Output tensors
     obj_mask = ByteTensor(nB, nA, nG, nG).fill_(0)
@@ -285,23 +298,55 @@ def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
     th = FloatTensor(nB, nA, nG, nG).fill_(0)
     tcls = FloatTensor(nB, nA, nG, nG, nC).fill_(0)
 
+    assert target.shape[0] == pred_cls.shape[0]
+
+    # split targets
+    for i, box in enumerate(target):
+        for j in range (0, box.shape[0], 5):
+            if box[j].item() < 0:
+                break
+            else:
+                image_idx = torch.FloatTensor([i]).cuda()
+                temp = torch.cat((image_idx, box[j: j+5]), 0)
+                if j == 0 and i == 0:
+                    tar = temp.view(1, 6)
+                else:
+                    tar = torch.cat((tar, temp.view(1, 6)), 0).view(-1, 6)
+
+    # filter out class labels not included
+    flag = 0
+    has_class = False
+    for i in range(tar.size()[0]):
+        if tar[i, 1] < 5:
+            has_class = True
+            if flag == 0:
+                target_n = (tar[i, :]).view(1, 6)
+                flag = 1
+            else:
+                target_n = torch.cat((target_n, (tar[i, :]).view(1, 6)), 0)
+
+    # if this batch has no targets of the 5 classes
+    if has_class is False:
+        return has_class, iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, 0
+
     # Convert to position relative to box
-    target_boxes = target[:, 2:6] * nG
+    target_boxes = target_n[:, 2:6] * nG
     gxy = target_boxes[:, :2]
     gwh = target_boxes[:, 2:]
     # Get anchors with best iou
     ious = torch.stack([bbox_wh_iou(anchor, gwh) for anchor in anchors])
     best_ious, best_n = ious.max(0)
     # Separate target values
-    b, target_labels = target[:, :2].long().t()
-    gx, gy = gxy.t()
+    b, target_labels = target_n[:, :2].long().t()
+    gx, gy = gxy.t() #x, y is center location
     gw, gh = gwh.t()
     gi, gj = gxy.long().t()
     # Set masks
-    obj_mask[b, best_n, gj, gi] = 1
-    noobj_mask[b, best_n, gj, gi] = 0
+    obj_mask[b, best_n, gj, gi] = 1 #将每个target box所负责的grid中与其iou最高的anchor标记为1
+    noobj_mask[b, best_n, gj, gi] = 0 #将每个target box所负责的grid中与其iou最高的anchor标记为0
 
     # Set noobj mask to zero where iou exceeds ignore threshold
+    # 如果有别的anchor ious大于阈值了，也标记成0
     for i, anchor_ious in enumerate(ious.t()):
         noobj_mask[b[i], anchor_ious > ignore_thres, gj[i], gi[i]] = 0
 
@@ -313,9 +358,10 @@ def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
     th[b, best_n, gj, gi] = torch.log(gh / anchors[best_n][:, 1] + 1e-16)
     # One-hot encoding of label
     tcls[b, best_n, gj, gi, target_labels] = 1
+
     # Compute label correctness and iou at best anchor
     class_mask[b, best_n, gj, gi] = (pred_cls[b, best_n, gj, gi].argmax(-1) == target_labels).float()
     iou_scores[b, best_n, gj, gi] = bbox_iou(pred_boxes[b, best_n, gj, gi], target_boxes, x1y1x2y2=False)
 
     tconf = obj_mask.float()
-    return iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf
+    return has_class, iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf
