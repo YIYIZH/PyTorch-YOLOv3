@@ -8,7 +8,7 @@ import numpy as np
 
 from utils.parse_config import *
 from utils.utils import build_targets, to_cpu, non_max_suppression
-
+import json
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
@@ -72,9 +72,10 @@ def create_modules(module_defs):
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in anchor_idxs]
             num_classes = int(module_def["classes"])
+            num_we = int(module_def["wordem"])
             img_size = int(hyperparams["height"])
             # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes, img_size)
+            yolo_layer = YOLOLayer(anchors, num_classes, num_we, img_size)
             modules.add_module("yolo_%s" %(module_i), yolo_layer)
         # Register module list and number of output filters
         module_list.append(modules)
@@ -106,11 +107,12 @@ class EmptyLayer(nn.Module):
 class YOLOLayer(nn.Module):
     """Detection layer"""
 
-    def __init__(self, anchors, num_classes, img_dim=416):
+    def __init__(self, anchors, num_classes, num_we, img_dim=416):
         super(YOLOLayer, self).__init__()
         self.anchors = anchors
         self.num_anchors = len(anchors)
         self.num_classes = num_classes
+        self.num_we = num_we
         self.ignore_thres = 0.5
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCELoss()
@@ -144,18 +146,33 @@ class YOLOLayer(nn.Module):
         grid_size = x.size(2)
 
         prediction = (
-            x.view(num_samples, self.num_anchors, self.num_classes + 5, grid_size, grid_size)
+            x.view(num_samples, self.num_anchors, self.num_we +5, grid_size, grid_size)
             .permute(0, 1, 3, 4, 2)
             .contiguous()
         )
-
+        #np.save('test.npy', prediction.detach().cpu().numpy())
         # Get outputs
         x = torch.sigmoid(prediction[..., 0])  # Center x
         y = torch.sigmoid(prediction[..., 1])  # Center y
         w = prediction[..., 2]  # Width
         h = prediction[..., 3]  # Height
         pred_conf = torch.sigmoid(prediction[..., 4])  # Conf
-        pred_cls = torch.sigmoid(prediction[..., 5:])  # Cls pred.
+        # 将词向量转成class predicted
+        # 将这100个feature concate一起成300
+        wordem = prediction[..., 5:].contiguous().view(num_samples, grid_size, grid_size, -1)
+
+        # 读入词向量
+        with open('we.json', 'r') as jsonfile:
+            we = json.load(jsonfile)
+        we_out = []
+        for i in range (len(we)):
+            we_out.extend(np.mean(we[i], axis=1))
+
+        #calculate pred_cls of reshape (batch size,3,g,g,class)
+        pred_cls = np.dot(wordem.cpu().detach().numpy(), np.array(we_out).reshape(self.num_we * 3, -1))
+        pred_cls = np.stack((pred_cls, pred_cls, pred_cls), axis=1) # 3个scale的class是一样的
+        pred_cls = torch.sigmoid(torch.from_numpy(pred_cls)).type(FloatTensor)
+        #pred_cls= torch.sigmoid(prediction[..., 5:])  # Cls pred.
 
         # If grid size does not match current we compute new offsets
         if grid_size != self.grid_size:
@@ -180,13 +197,18 @@ class YOLOLayer(nn.Module):
         if targets is None:
             return output, 0
         else:
-            iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf = build_targets(
+            has_class, iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf = build_targets(
                 pred_boxes=pred_boxes,
                 pred_cls=pred_cls,
                 target=targets,
                 anchors=self.scaled_anchors,
                 ignore_thres=self.ignore_thres,
             )
+            '''
+            if has_class is False:
+                loss = torch.cuda.FloatTensor(1).fill_(0)
+                return output, loss
+            '''
 
             # Loss : Mask outputs to ignore non-existing objects (except with conf. loss)
             loss_x = self.mse_loss(x[obj_mask], tx[obj_mask])
@@ -246,6 +268,7 @@ class Darknet(nn.Module):
     def forward(self, x, targets=None):
         img_dim = x.shape[2]
         loss = 0
+
         layer_outputs, yolo_outputs = [], []
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
             if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
@@ -260,8 +283,8 @@ class Darknet(nn.Module):
                 loss += layer_loss
                 yolo_outputs.append(x)
             layer_outputs.append(x)
-        yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
-        return yolo_outputs if targets is None else (loss, yolo_outputs)
+        yolo_outputs = torch.cat(yolo_outputs, 1)
+        return yolo_outputs if targets is None else loss
 
     def load_darknet_weights(self, weights_path):
         """Parses and loads the weights stored in 'weights_path'"""
