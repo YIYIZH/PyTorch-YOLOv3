@@ -123,8 +123,9 @@ class ListDataset(Dataset):
             boxes[:, 3] *= w_factor / padded_w
             boxes[:, 4] *= h_factor / padded_h
 
-            targets = torch.zeros((len(boxes), 6))
-            targets[:, 1:] = boxes
+            #targets = torch.zeros((len(boxes), 5))
+            #targets[:, 1:] = boxes
+            targets = boxes.reshape(1, -1)
 
         # Apply augmentations
         if self.augment:
@@ -136,18 +137,38 @@ class ListDataset(Dataset):
     def collate_fn(self, batch):
         paths, imgs, targets = list(zip(*batch))
         # Remove empty placeholder targets
-        targets = [boxes for boxes in targets if boxes is not None]
+        #targets = [boxes for boxes in targets if boxes is not None]
         # Add sample index to targets
-        for i, boxes in enumerate(targets):
-            boxes[:, 0] = i
-        targets = torch.cat(targets, 0)
+        #for i, boxes in enumerate(targets):
+            #boxes[:, 0] = i
+        size = 0
+        for n in targets:
+            size = n.shape[1] if n.shape[1] > size else size
+
+        for i, bbox in enumerate(targets):
+            if (size - bbox.shape[1]) <= 0:
+                if i == 0:
+                    bb = bbox
+                else:
+                    bb = torch.cat((bb, bbox,), 0)
+            else:
+                if i == 0:
+                    l = torch.DoubleTensor([-1] * (size - bbox.shape[1])).view(1, -1)
+                    bb = torch.cat((bbox, l,), 1)
+
+                else:
+                    l = torch.DoubleTensor([-1] * (size - bbox.shape[1])).view(1, -1)
+                    b = torch.cat((bbox, l,), 1)
+                    bb = torch.cat((bb, b), 0)
+
+
         # Selects new image size every tenth batch
         if self.multiscale and self.batch_count % 10 == 0:
             self.img_size = random.choice(range(self.min_size, self.max_size + 1, 32))
         # Resize images to input shape
         imgs = torch.stack([resize(img, self.img_size) for img in imgs])
         self.batch_count += 1
-        return paths, imgs, targets
+        return paths, imgs, bb.float()
 
     def __len__(self):
         return len(self.img_files)
