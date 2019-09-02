@@ -16,7 +16,9 @@ import datetime
 import argparse
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.distributed as dist
 from torchvision import datasets
 from torchvision import transforms
 from torch.autograd import Variable
@@ -33,15 +35,17 @@ if __name__ == "__main__":
     parser.add_argument("--n_cpu", type=int, default=4, help="number of cpu threads to use during batch generation")
     parser.add_argument("--img_size", type=int, default=416, help="size of each image dimension")
     parser.add_argument("--checkpoint_interval", type=int, default=10, help="interval between saving model weights")
-    parser.add_argument("--evaluation_interval", type=int, default=1, help="interval evaluations on validation set")
+    parser.add_argument("--evaluation_interval", type=int, default=5, help="interval evaluations on validation set")
     parser.add_argument("--compute_map", default=False, help="if True computes mAP every tenth batch")
     parser.add_argument("--multiscale_training", default=True, help="allow for multi-scale training")
+    #parser.add_argument("--mixed_precision", default=True, help="if multi GPU is used")
     opt = parser.parse_args()
     print(opt)
 
     logger = Logger("logs")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     os.makedirs("output", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
@@ -53,8 +57,14 @@ if __name__ == "__main__":
     class_names = load_classes(data_config["names"])
 
     # Initiate model
-    model = Darknet(opt.model_def).to(device)
+    model = Darknet(opt.model_def)
     model.apply(weights_init_normal)
+
+    # use multi GPU
+    if torch.cuda.device_count()>1:
+        model = torch.nn.DataParallel(model, device_ids=[0,1,2,3])
+
+    model.to(device)
 
     # If specified we start from checkpoint
     if opt.pretrained_weights:
@@ -75,6 +85,7 @@ if __name__ == "__main__":
     )
 
     optimizer = torch.optim.Adam(model.parameters())
+    optimizer = nn.DataParallel(optimizer)
 
     metrics = [
         "grid_size",
@@ -102,13 +113,20 @@ if __name__ == "__main__":
             imgs = Variable(imgs.to(device))
             targets = Variable(targets.to(device), requires_grad=False)
 
-            loss, outputs = model(imgs, targets)
-            loss.backward()
+            loss = model(imgs, targets)
+            #output = to_cpu(output)
+            #loss = compute_loss(outputs, targets)
+            if loss.sum() == 0:
+                continue
 
+            loss.sum().backward()
             if batches_done % opt.gradient_accumulations:
                 # Accumulates gradient before each step
-                optimizer.step()
+                optimizer.module.step()
                 optimizer.zero_grad()
+
+            if isinstance(model, torch.nn.DataParallel):
+                model = model.module
 
             # ----------------
             #   Log progress
@@ -117,8 +135,6 @@ if __name__ == "__main__":
             log_str = "\n---- [Epoch %d/%d, Batch %d/%d] ----\n" % (epoch, opt.epochs, batch_i, len(dataloader))
             for i in range(len(model.yolo_layers)):
                 metric_table = [["Metrics", *["YOLO Layer %d" %(i)]]]
-
-
 
             # Log metrics at each YOLO layer
             for i, metric in enumerate(metrics):
@@ -134,11 +150,11 @@ if __name__ == "__main__":
                     for name, metric in yolo.metrics.items():
                         if name != "grid_size":
                             tensorboard_log += [("%s_(%d+1)" %(name, j), metric)]
-                tensorboard_log += [("loss", loss.item())]
+                tensorboard_log += [("loss", loss.sum().item())]
                 logger.list_of_scalars_summary(tensorboard_log, batches_done)
 
             log_str += AsciiTable(metric_table).table
-            log_str += "\nTotal loss %s" %(loss.item())
+            log_str += "\nTotal loss %s" %(loss.sum().item())
 
             # Determine approximate time left for epoch
             epoch_batches_left = len(dataloader) - (batch_i + 1)
